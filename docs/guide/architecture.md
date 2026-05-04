@@ -1,0 +1,215 @@
+# Architecture
+
+This page describes how the components of Conflux fit together.
+
+## Overview
+
+The core abstractions provided by Conflux are the multi-rate simulation loop ([`Coordinator`][conflux.coordinator.Coordinator]) and interfaces for datacenter ([`DatacenterBackend`][conflux.datacenter.base.DatacenterBackend]), grid ([`GridBackend`][conflux.grid.base.GridBackend]), and controller ([`Controller`][conflux.controller.base.Controller]) components.
+
+```
+                    ┌─────────────────────────────┐
+                    │        Coordinator          │
+                    │   (main simulation loop)    │
+                    │                             │
+                    │   tick = GCD of all rates   │
+                    │   e.g., tick = 0.1 s        │
+                    └──┬──────────┬──────────┬────┘
+                       │          │          │
+        every 0.1 s    │          │          │   every 1.0 s
+      ┌────────────────┘          │          └────────────────┐
+      v                      every 0.5 s                      v
+┌───────────────┐                 │                  ┌───────────────────┐
+│  Datacenter   │                 v                  │  Controller(s)    │
+│  Backend      │         ┌────────────────┐         │                   │
+│               │         │  Grid Backend  │         │  Read DC & grid   │
+│  Produces:    │<─power─>│                │         │  state, compute   │
+│  power load   │         │  Power flow    │         │  commands         │
+│  latency      │         │  solver        │<──cmds──│                   │
+│  throughput   │         └────────────────┘         │ e.g. SetBatchSize │
+│               │<────────────────cmds───────────────│      SetTaps      │
+└───────────────┘                                    └───────────────────┘
+```
+
+The coordinator supports **multiple datacenter sites**, each connected to a different bus on the grid. Controllers hold references to their datacenter(s) and grid from construction time, and set `command.target` explicitly on every datacenter command they emit.
+
+Controllers return a list of [`GridCommand`][conflux.grid.command.GridCommand] (e.g., [`SetTaps`][conflux.grid.command.SetTaps]) and/or [`DatacenterCommand`][conflux.datacenter.command.DatacenterCommand] (e.g., [`SetBatchSize`][conflux.datacenter.command.SetBatchSize], [`ShiftReplicas`][conflux.datacenter.command.ShiftReplicas]) that the coordinator dispatches to the appropriate backend before the next tick.
+Multiple controllers run in sequence each control step, so their actions compose naturally.
+
+Each [`DatacenterCommand`][conflux.datacenter.command.DatacenterCommand] carries a `target` reference to the datacenter it should be applied to. The coordinator dispatches via `command.target.apply_control()`. This enables cross-site controllers (like [`LoadShiftController`][conflux.controller.load_shift.LoadShiftController]) to send commands to multiple datacenters in a single step.
+
+## Simulation Loop
+
+The [`Coordinator`][conflux.coordinator.Coordinator] drives the simulation.
+It computes a base tick as the GCD of all component periods and advances a [`SimulationClock`][conflux.clock.SimulationClock] each tick.
+
+```
+for each tick:
+  1. if datacenter is due:    dc_state = datacenter.do_step(clock, events)
+  2. if grid is due:          grid_state = grid.do_step(clock, power_samples, events)
+  3. for each controller:
+       if controller is due:  action = controller.step(clock, events)
+                              apply action to datacenter and/or grid
+```
+
+The period of each component (`dt_s`) is specified as a `fractions.Fraction` object in seconds (e.g., `Fraction(1, 10)` for 0.1 s), which allows for exact representation of intervals and GCD calculation without floating-point issues.
+The coordinator checks `clock.is_due(component.dt_s)` to determine if they should run.
+
+### What Happens in One Tick
+
+Zooming into a sequence of coordinator ticks (DC at 0.1 s, grid and controller at 1.0 s):
+
+```
+  ...
+
+  simulation clock = 5.1 s      simulation clock = 5.2 s
+  │                             │
+  ├─ DC step -- YES             ├─ DC step -- YES
+  │  └─ Return power sample     │  └─ Return power sample
+  │     (+ workload metrics)    │     (+ workload metrics)
+  │                             │
+  ├─ Grid step? -- NO           ├─ Grid step? -- NO
+  │  (grid runs at 1.0 s)       │
+  │                             │
+  ├─ Controller step? -- NO     ├─ Controller step? -- NO
+  │  (ctrl runs at 1.0 s)       │
+  │                             │
+  │  Accumulate power samples   │  Accumulate power samples
+
+  ...
+
+  simulation clock = 6.0 s
+  │
+  ├─ DC step -- YES
+  │  └─ Return power sample
+  │
+  ├─ Grid step? -- YES
+  │  ├─ Receives accumulated power samples
+  │  ├─ Runs power flow
+  │  └─ Returns bus voltages
+  │
+  ├─ Controller step? -- YES
+  │  ├─ Reads datacenter and grid state (e.g., power, latency, voltage)
+  │  ├─ Computes control action (e.g., SetBatchSize, SetTaps)
+  │  └─ Issues commands -> datacenter and/or grid
+  │
+  └─ Clear accumulated power samples
+```
+
+### Live Mode
+
+When `live=True` is passed to the [`Coordinator`][conflux.coordinator.Coordinator], it instantiates [`SimulationClock`][conflux.clock.SimulationClock] in live mode.
+In this mode, the simulation clock synchronizes with the wall-clock.
+That is, when [`clock.advance()`][conflux.clock.SimulationClock.advance] is called, the clock checks how much time has elapsed since the last tick and sleeps for the remaining time until the next tick is due at the wall clock.
+This enables hardware-in-the-loop experiments where the [`OnlineDatacenter`][conflux.datacenter.online.OnlineDatacenter] reads live GPU power and the controller reacts in real time, while sharing most of the code path with offline simulation.
+
+## Component Interfaces
+
+Each component type has an abstract base class in `conflux`. For full typed code examples and guidelines for extending, see [Writing Custom Components](building-simulators.md#writing-custom-components).
+
+### `DatacenterBackend`
+
+[`conflux.datacenter.base.DatacenterBackend`][conflux.datacenter.base.DatacenterBackend]. Key methods:
+
+- [`dt_s`][conflux.datacenter.base.DatacenterBackend.dt_s]: The component's timestep
+- [`step(clock, events)`][conflux.datacenter.base.DatacenterBackend.step]: Produce one power sample (returns a [`DatacenterState`][conflux.datacenter.base.DatacenterState] containing three-phase power in watts)
+- [`apply_control(command, events)`][conflux.datacenter.base.DatacenterBackend.apply_control]: Accept a command (e.g., [`SetBatchSize`][conflux.datacenter.command.SetBatchSize], [`ShiftReplicas`][conflux.datacenter.command.ShiftReplicas])
+- [`state`][conflux.datacenter.base.DatacenterBackend.state] / [`history(n)`][conflux.datacenter.base.DatacenterBackend.history]: Current and past states (managed automatically by the base class), readable by controllers
+
+Built-in implementations: [`OfflineDatacenter`][conflux.datacenter.offline.OfflineDatacenter], [`OnlineDatacenter`][conflux.datacenter.online.OnlineDatacenter].
+
+### `GridBackend`
+
+[`conflux.grid.base.GridBackend`][conflux.grid.base.GridBackend]. Key methods:
+
+- [`dt_s`][conflux.grid.base.GridBackend.dt_s]: The grid solver's timestep
+- [`step(clock, power_samples_w, events)`][conflux.grid.base.GridBackend.step]: Run power flow on accumulated DC power samples, return per-bus per-phase voltages
+- [`apply_control(command, events)`][conflux.grid.base.GridBackend.apply_control]: Accept a command (e.g., [`SetTaps`][conflux.grid.command.SetTaps])
+
+Built-in implementation: [`OpenDSSGrid`][conflux.grid.opendss.OpenDSSGrid].
+
+### `Controller`
+
+[`conflux.controller.base.Controller`][conflux.controller.base.Controller]. Key methods:
+
+- [`dt_s`][conflux.controller.base.Controller.dt_s]: The control interval
+- [`step(clock, events)`][conflux.controller.base.Controller.step]: Compute and return a list of commands to be applied to the datacenter and/or grid this tick. Controllers hold references to their datacenter(s) and grid from construction time and read state via those references.
+
+Built-in implementations: [`OFOBatchSizeController`][conflux.controller.ofo.OFOBatchSizeController], [`RuleBasedBatchSizeController`][conflux.controller.rule_based.RuleBasedBatchSizeController], [`TapScheduleController`][conflux.controller.tap_schedule.TapScheduleController], [`LoadShiftController`][conflux.controller.load_shift.LoadShiftController], [`BatchSizeScheduleController`][conflux.controller.batch_size_schedule.BatchSizeScheduleController], [`NoopController`][conflux.controller.noop.NoopController].
+
+## Component Lifecycle
+
+All components implement the following lifecycle methods:
+
+- **`__init__`** (or any class method that instantiates the object): Store configuration and do expensive one-time setup that is reusable across runs (e.g., build power templates, parse config). Does *not* acquire per-run resources. Backend subclasses must call `super().__init__()` to initialize the base class's state and history tracking.
+- **`reset()`**: Clear component-specific simulation state (counters, RNG seeds, cached values). Configuration is not affected. For backends, history is cleared automatically by the coordinator's `do_reset()` wrapper.
+- **`start()`**: Acquire per-run resources (compile DSS circuits, start threads). No-op by default.
+- **`stop()`**: Release per-run resources. State is preserved for post-run inspection. No-op by default.
+
+After the component is instantiated, the coordinator calls `do_reset()` (which clears history and calls `reset()`), then `start()`, then enters the simulation loop where it calls `do_step()` and `apply_control()` as needed, and finally calls `stop()` at the end of the run.
+
+```
+__init__() ──> do_reset() ──> start() ──> do_step() / apply_control() ──> stop()
+                 ^                                                     │
+                 └─────────────── (repeat from reset) ─────────────────┘
+```
+
+This is mainly to allow reuse component objects across multiple [`Coordinator.run()`][conflux.coordinator.Coordinator.run] calls with different configurations without having to re-instantiate all of them all the time:
+
+```python
+grid = OpenDSSGrid(...)                    # stores config only
+for workload in workloads:
+    dc = OfflineDatacenter(dc_config, workload, name="dc", dt_s=dt)
+    grid.attach_dc(dc, bus="671")
+    ctrl = OFOBatchSizeController(specs, datacenter=dc, ...)
+    coord = Coordinator(datacenters=[dc], grid=grid, controllers=[ctrl], total_duration_s=3600)
+    log = coord.run()                      # reset -> start -> loop -> stop
+```
+
+
+## State Types and Generics
+
+Different backends produce different state.
+Every datacenter returns `time_s` and `power_w`, but an LLM inference datacenter also reports `batch_size_by_model` and `observed_itl_s_by_model`, and the offline backend further adds `power_by_model_w`.
+Similarly, not every controller works with every backend: an OFO controller needs LLM-specific state that a generic datacenter doesn't provide.
+
+Conflux uses Python generics to encode these relationships.
+This serves two purposes:
+
+- Incompatible pairings (e.g., an OFO batch size controller with a non-LLM datacenter) are caught at construction time with type errors rather than runtime crashes or, worse, silent bugs.
+- Type information propagates through the system so that downstream objects like [`SimulationLog`][conflux.coordinator.SimulationLog] carry the specific state types rather than overly generic ones. For instance, `log.dc_states` will be correctly recognized as `list[OfflineDatacenterState]` instead of the generic `list[DatacenterState]`, giving you access to LLM-specific fields in autocompletion and type checking.
+
+**State inheritance.** State types form a hierarchy where each level adds domain-specific fields:
+
+```
+DatacenterState                 (time_s, power_w)
+└── LLMDatacenterState          (+ batch_size_by_model, active_replicas_by_model, ...)
+    └── OfflineDatacenterState  (+ power_by_model_w)
+    └── OnlineDatacenterState   (+ measured_power_w, augmentation_factor_by_model, ...)
+```
+
+**Backend generics.** Each backend declares which state type it produces:
+
+```python
+class DatacenterBackend(Generic[DCStateT], ABC): ...
+class LLMBatchSizeControlledDatacenter(DatacenterBackend[DCStateT]): ...
+class OfflineDatacenter(LLMBatchSizeControlledDatacenter[OfflineDatacenterState]): ...
+```
+
+**Controller generics.** Controllers declare which backends they require. The coordinator validates these constraints when you construct it:
+
+```python
+class Controller(Generic[DCBackendT, GridBackendT], ABC): ...
+
+# Works with any datacenter and any grid
+class TapScheduleController(Controller[DatacenterBackend, GridBackend]): ...
+
+# Requires an LLM datacenter and OpenDSS specifically
+class OFOBatchSizeController(Controller[LLMBatchSizeControlledDatacenter, OpenDSSGrid]): ...
+```
+
+## `SimulationLog`
+
+[`Coordinator.run()`][conflux.coordinator.Coordinator.run] returns a [`SimulationLog`][conflux.coordinator.SimulationLog] that collects all state history.
+Essentially, this object is a bill of materials for everything that happened during the simulation, and is the basis for all post-run analysis and plotting.
+It records a list of datacenter and grid state snapshots, one per step (`log.dc_states`, `log.grid_states`), plus convenience time-series arrays for plotting.
+See [`SimulationLog`][conflux.coordinator.SimulationLog] for available fields and [Building Simulators: Analyzing Results](building-simulators.md#analyzing-results) for usage examples.
