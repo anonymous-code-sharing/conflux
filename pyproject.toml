@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conflux"
+dynamic = ["version"]
+description = "A modular library for simulating AI datacenter--grid runtime coordination."
+requires-python = ">=3.10"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pydantic>=2.0",
+    "aiohttp",
+    "zeus>=0.15.0",
+    "mlenergy-data",
+]
+
+[project.urls]
+Homepage = "https://anonymous.example/conflux"
+Repository = "https://github.com/anonymous-code-sharing/conflux"
+Documentation = "https://anonymous.example/conflux"
+
+[project.optional-dependencies]
+opendss = ["opendssdirect.py"]
+rl = ["stable-baselines3>=2.0", "gymnasium"]
+
+[dependency-groups]
+test = ["pytest"]
+lint = ["ruff", "ty"]
+docs = ["zensical", "mkdocstrings[python]", "tomlkit"]
+examples = ["conflux[opendss]", "conflux[rl]", "matplotlib", "datasets", "openai", "pyyaml", "tyro"]
+dev = [
+    {include-group = "test"},
+    {include-group = "lint"},
+    {include-group = "docs"},
+    {include-group = "examples"},
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "conflux.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["conflux*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "RUF",    # ruff-specific
+]
+ignore = [
+    "SIM108",  # ternary operator; prefer explicit if/else for readability
+    "RUF046",  # unnecessary int() cast; defensive casting is intentional
+    "RUF001",  # ambiguous unicode; intentional Greek letters in paper cross-refs
+    "RUF002",  # ambiguous unicode in docstrings; same
+    "RUF003",  # ambiguous unicode in comments; same
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["conflux"]
+known-local-folder = ["plotting", "systems"]
+
+[tool.ty.environment]
+python-version = "3.10"
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+invalid-argument-type = "ignore"
+unresolved-attribute = "ignore"
+invalid-method-override = "ignore"
+not-subscriptable = "ignore"
+invalid-return-type = "ignore"
+invalid-type-form = "ignore"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
